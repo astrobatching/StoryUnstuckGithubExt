@@ -1,0 +1,213 @@
+/*
+  # Prompts Schema
+
+  1. New Tables
+    - `prompt_categories`
+      - `id` (uuid, primary key)
+      - `user_id` (uuid, references auth.users)
+      - `title` (text)
+      - `description` (text)
+      - `color` (text)
+      - `position` (integer)
+      - `created_at` (timestamptz)
+      - `updated_at` (timestamptz)
+
+    - `prompts`
+      - `id` (uuid, primary key)
+      - `category_id` (uuid, references prompt_categories)
+      - `user_id` (uuid, references auth.users)
+      - `title` (text)
+      - `content` (text)
+      - `action_steps` (jsonb)
+      - `position` (integer)
+      - `created_at` (timestamptz)
+      - `updated_at` (timestamptz)
+
+    - `prompt_tags`
+      - `id` (uuid, primary key)
+      - `prompt_id` (uuid, references prompts)
+      - `name` (text)
+      - `created_at` (timestamptz)
+
+    - `prompt_responses`
+      - `id` (uuid, primary key)
+      - `prompt_id` (uuid, references prompts)
+      - `user_id` (uuid, references auth.users)
+      - `content` (text)
+      - `status` (text)
+      - `created_at` (timestamptz)
+      - `updated_at` (timestamptz)
+
+  2. Security
+    - Enable RLS on all tables
+    - Add policies for authenticated users
+    - Add policies for prompt ownership
+
+  3. Indexes
+    - Add indexes for common queries
+    - Add full-text search capabilities
+*/
+
+-- Categories table for organizing prompts
+CREATE TABLE IF NOT EXISTS prompt_categories (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES auth.users(id),
+  title text NOT NULL,
+  description text,
+  color text NOT NULL,
+  position integer NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Core prompts table
+CREATE TABLE IF NOT EXISTS prompts (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  category_id uuid NOT NULL REFERENCES prompt_categories(id) ON DELETE CASCADE,
+  user_id uuid NOT NULL REFERENCES auth.users(id),
+  title text NOT NULL,
+  content text NOT NULL,
+  action_steps jsonb DEFAULT '[]'::jsonb,
+  position integer NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Tags for organizing prompts
+CREATE TABLE IF NOT EXISTS prompt_tags (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  prompt_id uuid NOT NULL REFERENCES prompts(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(prompt_id, name)
+);
+
+-- Responses to prompts
+CREATE TABLE IF NOT EXISTS prompt_responses (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  prompt_id uuid NOT NULL REFERENCES prompts(id) ON DELETE CASCADE,
+  user_id uuid NOT NULL REFERENCES auth.users(id),
+  content text NOT NULL,
+  status text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'complete', 'archived')),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Add indexes for common queries
+CREATE INDEX IF NOT EXISTS prompt_categories_user_id_idx ON prompt_categories(user_id);
+CREATE INDEX IF NOT EXISTS prompt_categories_position_idx ON prompt_categories(position);
+
+CREATE INDEX IF NOT EXISTS prompts_category_id_idx ON prompts(category_id);
+CREATE INDEX IF NOT EXISTS prompts_user_id_idx ON prompts(user_id);
+CREATE INDEX IF NOT EXISTS prompts_position_idx ON prompts(position);
+CREATE INDEX IF NOT EXISTS prompts_created_at_idx ON prompts(created_at DESC);
+
+CREATE INDEX IF NOT EXISTS prompt_tags_prompt_id_idx ON prompt_tags(prompt_id);
+CREATE INDEX IF NOT EXISTS prompt_tags_name_idx ON prompt_tags(name);
+
+CREATE INDEX IF NOT EXISTS prompt_responses_prompt_id_idx ON prompt_responses(prompt_id);
+CREATE INDEX IF NOT EXISTS prompt_responses_user_id_idx ON prompt_responses(user_id);
+CREATE INDEX IF NOT EXISTS prompt_responses_status_idx ON prompt_responses(status);
+
+-- Add full text search
+ALTER TABLE prompts ADD COLUMN fts tsvector 
+  GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
+    setweight(to_tsvector('english', coalesce(content, '')), 'B')
+  ) STORED;
+
+CREATE INDEX prompts_fts_idx ON prompts USING gin(fts);
+
+-- Enable RLS
+ALTER TABLE prompt_categories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE prompts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE prompt_tags ENABLE ROW LEVEL SECURITY;
+ALTER TABLE prompt_responses ENABLE ROW LEVEL SECURITY;
+
+-- RLS Policies
+CREATE POLICY "Users can manage their own categories"
+  ON prompt_categories
+  FOR ALL
+  USING (auth.uid() = user_id);
+
+CREATE POLICY "Users can manage their own prompts"
+  ON prompts
+  FOR ALL
+  USING (auth.uid() = user_id);
+
+CREATE POLICY "Users can manage tags for their prompts"
+  ON prompt_tags
+  FOR ALL
+  USING (EXISTS (
+    SELECT 1 FROM prompts
+    WHERE prompts.id = prompt_tags.prompt_id
+    AND prompts.user_id = auth.uid()
+  ));
+
+CREATE POLICY "Users can manage their own responses"
+  ON prompt_responses
+  FOR ALL
+  USING (auth.uid() = user_id);
+
+-- Functions for managing prompts
+CREATE OR REPLACE FUNCTION update_prompt_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER prompts_updated_at
+  BEFORE UPDATE ON prompts
+  FOR EACH ROW
+  EXECUTE FUNCTION update_prompt_updated_at();
+
+CREATE TRIGGER prompt_categories_updated_at
+  BEFORE UPDATE ON prompt_categories
+  FOR EACH ROW
+  EXECUTE FUNCTION update_prompt_updated_at();
+
+CREATE TRIGGER prompt_responses_updated_at
+  BEFORE UPDATE ON prompt_responses
+  FOR EACH ROW
+  EXECUTE FUNCTION update_prompt_updated_at();
+
+-- Function to search prompts with relevance ranking
+CREATE OR REPLACE FUNCTION search_prompts(
+  search_query text,
+  user_id_param uuid,
+  category_id_param uuid DEFAULT NULL,
+  tag_filter text[] DEFAULT NULL
+) RETURNS TABLE (
+  id uuid,
+  title text,
+  content text,
+  category_id uuid,
+  created_at timestamptz,
+  rank float4
+) AS $$
+BEGIN
+  RETURN QUERY
+  SELECT
+    p.id,
+    p.title,
+    p.content,
+    p.category_id,
+    p.created_at,
+    ts_rank(p.fts, websearch_to_tsquery('english', search_query)) as rank
+  FROM prompts p
+  WHERE p.user_id = user_id_param
+    AND (category_id_param IS NULL OR p.category_id = category_id_param)
+    AND (tag_filter IS NULL OR EXISTS (
+      SELECT 1 FROM prompt_tags t
+      WHERE t.prompt_id = p.id
+      AND t.name = ANY(tag_filter)
+    ))
+    AND (
+      search_query = '' OR
+      p.fts @@ websearch_to_tsquery('english', search_query)
+    )
+  ORDER BY rank DESC, p.created_at DESC;
+END;
+$$ LANGUAGE plpgsql;

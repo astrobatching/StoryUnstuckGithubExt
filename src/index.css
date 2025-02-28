@@ -1,0 +1,68 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+.timeline-slot-card {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  transition: all 0.3s ease;
+}
+
+.timeline-slot-content {
+  transform-origin: top left;
+  text-overflow: ellipsis;
+}
+
+/* Color Legend Animation */
+.color-legend-enter {
+  transform: translateY(100%);
+}
+
+.color-legend-enter-active {
+  transform: translateY(0);
+  transition: transform 300ms ease-in-out;
+}
+
+.color-legend-exit {
+  transform: translateY(0);
+}
+
+.color-legend-exit-active {
+  transform: translateY(100%);
+  transition: transform 300ms ease-in-out;
+}
+
+/* Prevent content shift when color legend is fixed */
+.content-with-legend {
+  padding-bottom: 2.5rem;
+}
+
+/* Floating panel styles */
+.floating-panel {
+  pointer-events: none;
+}
+
+.floating-panel > * {
+  pointer-events: auto;
+}
+
+/* Overlay styles */
+.overlay-container {
+  position: relative;
+  z-index: 1;
+}
+
+.overlay-container::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.1);
+  opacity: 0;
+  transition: opacity 300ms ease-in-out;
+  pointer-events: none;
+}
+
+.overlay-container.active::after {
+  opacity: 1;
+}

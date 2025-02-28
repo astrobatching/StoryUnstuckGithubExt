@@ -1,0 +1,190 @@
+/*
+  # Idea Pile Schema
+
+  1. New Tables
+    - `idea_categories`
+      - `id` (uuid, primary key)
+      - `title` (text)
+      - `subtitle` (text)
+      - `color` (text)
+      - `position` (integer)
+      - `user_id` (uuid, references auth.users)
+      - `created_at` (timestamptz)
+      - `updated_at` (timestamptz)
+
+    - `idea_items`
+      - `id` (uuid, primary key)
+      - `category_id` (uuid, references idea_categories)
+      - `user_id` (uuid, references auth.users)
+      - `title` (text)
+      - `content` (text)
+      - `type` (text, enum)
+      - `status` (text, enum)
+      - `position` (integer)
+      - `metadata` (jsonb)
+      - `created_at` (timestamptz)
+      - `updated_at` (timestamptz)
+
+    - `idea_tags`
+      - `id` (uuid, primary key)
+      - `idea_id` (uuid, references idea_items)
+      - `name` (text)
+      - `created_at` (timestamptz)
+
+  2. Security
+    - Enable RLS on all tables
+    - Add policies for authenticated users
+    - Add policies for idea ownership
+
+  3. Indexes
+    - Add indexes for common queries
+    - Add full-text search capabilities
+*/
+
+-- Categories table for organizing ideas
+CREATE TABLE IF NOT EXISTS idea_categories (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES auth.users(id),
+  title text NOT NULL,
+  subtitle text,
+  color text NOT NULL,
+  position integer NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Core idea items table
+CREATE TABLE IF NOT EXISTS idea_items (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  category_id uuid NOT NULL REFERENCES idea_categories(id) ON DELETE CASCADE,
+  user_id uuid NOT NULL REFERENCES auth.users(id),
+  title text NOT NULL,
+  content text NOT NULL,
+  type text NOT NULL CHECK (type IN ('note', 'image', 'voice', 'link', 'reference')),
+  status text NOT NULL DEFAULT 'unprocessed' CHECK (status IN ('unprocessed', 'inuse', 'archived')),
+  position integer NOT NULL,
+  metadata jsonb DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Tags for organizing ideas
+CREATE TABLE IF NOT EXISTS idea_tags (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  idea_id uuid NOT NULL REFERENCES idea_items(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(idea_id, name)
+);
+
+-- Add indexes for common queries
+CREATE INDEX IF NOT EXISTS idea_categories_user_id_idx ON idea_categories(user_id);
+CREATE INDEX IF NOT EXISTS idea_categories_position_idx ON idea_categories(position);
+
+CREATE INDEX IF NOT EXISTS idea_items_category_id_idx ON idea_items(category_id);
+CREATE INDEX IF NOT EXISTS idea_items_user_id_idx ON idea_items(user_id);
+CREATE INDEX IF NOT EXISTS idea_items_type_idx ON idea_items(type);
+CREATE INDEX IF NOT EXISTS idea_items_status_idx ON idea_items(status);
+CREATE INDEX IF NOT EXISTS idea_items_position_idx ON idea_items(position);
+CREATE INDEX IF NOT EXISTS idea_items_created_at_idx ON idea_items(created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idea_tags_idea_id_idx ON idea_tags(idea_id);
+CREATE INDEX IF NOT EXISTS idea_tags_name_idx ON idea_tags(name);
+
+-- Add full text search
+ALTER TABLE idea_items ADD COLUMN fts tsvector 
+  GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
+    setweight(to_tsvector('english', coalesce(content, '')), 'B')
+  ) STORED;
+
+CREATE INDEX idea_items_fts_idx ON idea_items USING gin(fts);
+
+-- Enable RLS
+ALTER TABLE idea_categories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE idea_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE idea_tags ENABLE ROW LEVEL SECURITY;
+
+-- RLS Policies
+CREATE POLICY "Users can manage their own categories"
+  ON idea_categories
+  FOR ALL
+  USING (auth.uid() = user_id);
+
+CREATE POLICY "Users can manage their own ideas"
+  ON idea_items
+  FOR ALL
+  USING (auth.uid() = user_id);
+
+CREATE POLICY "Users can manage tags for their ideas"
+  ON idea_tags
+  FOR ALL
+  USING (EXISTS (
+    SELECT 1 FROM idea_items
+    WHERE idea_items.id = idea_tags.idea_id
+    AND idea_items.user_id = auth.uid()
+  ));
+
+-- Functions for managing ideas
+CREATE OR REPLACE FUNCTION update_idea_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER idea_items_updated_at
+  BEFORE UPDATE ON idea_items
+  FOR EACH ROW
+  EXECUTE FUNCTION update_idea_updated_at();
+
+CREATE TRIGGER idea_categories_updated_at
+  BEFORE UPDATE ON idea_categories
+  FOR EACH ROW
+  EXECUTE FUNCTION update_idea_updated_at();
+
+-- Function to search ideas with relevance ranking
+CREATE OR REPLACE FUNCTION search_ideas(
+  search_query text,
+  user_id_param uuid,
+  category_id_param uuid DEFAULT NULL,
+  status_filter text DEFAULT NULL,
+  tag_filter text[] DEFAULT NULL
+) RETURNS TABLE (
+  id uuid,
+  title text,
+  content text,
+  type text,
+  status text,
+  category_id uuid,
+  created_at timestamptz,
+  rank float4
+) AS $$
+BEGIN
+  RETURN QUERY
+  SELECT
+    i.id,
+    i.title,
+    i.content,
+    i.type,
+    i.status,
+    i.category_id,
+    i.created_at,
+    ts_rank(i.fts, websearch_to_tsquery('english', search_query)) as rank
+  FROM idea_items i
+  WHERE i.user_id = user_id_param
+    AND (category_id_param IS NULL OR i.category_id = category_id_param)
+    AND (status_filter IS NULL OR i.status = status_filter)
+    AND (tag_filter IS NULL OR EXISTS (
+      SELECT 1 FROM idea_tags t
+      WHERE t.idea_id = i.id
+      AND t.name = ANY(tag_filter)
+    ))
+    AND (
+      search_query = '' OR
+      i.fts @@ websearch_to_tsquery('english', search_query)
+    )
+  ORDER BY rank DESC, i.created_at DESC;
+END;
+$$ LANGUAGE plpgsql;
